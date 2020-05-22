@@ -123,9 +123,13 @@ def round_nearest_multiple(i, factor):
 
 
 def pix2norm(shape, pts):
+    assert isinstance(pts, np.ndarray) and pts.shape[-1] == 2 # (x,y)
+    # Normalized pts of image coordinates to coordinates that centered at the center of image
     height, width = shape[:2]
-    scl = 2.0/(max(height, width))
+    scl = 2.0/(max(height, width)) # 2 is for mapping [-0.5, 0.5] to [-1.0, 1.0], max(height, width) is to normalize all axis in [0, 1]
     offset = np.array([width, height], dtype=pts.dtype).reshape((-1, 1, 2))*0.5
+
+    # Each (x,y) will fall into [-1, 1]
     return (pts - offset) * scl
 
 
@@ -165,6 +169,17 @@ def draw_correspondences(img, dstpoints, projpts):
 
 
 def get_default_params(corners, ycoords, xcoords):
+    '''
+        corners:
+            [0]----------[1]
+             |            |
+             |            |
+             |            |
+             |            |
+             |            |
+            [3]----------[2]
+        
+    '''
 
     # page width and height
     page_width = np.linalg.norm(corners[1] - corners[0])
@@ -326,6 +341,7 @@ def get_mask(name, small, pagemask, masktype):
 
 
 def interval_measure_overlap(int_a, int_b):
+    # The distance of [max among minimums, min among maximums]
     return min(int_a[1], int_b[1]) - max(int_a[0], int_b[0])
 
 
@@ -346,20 +362,26 @@ def blob_mean_and_tangent(contour):
 
     moments = cv2.moments(contour)
 
-    area = moments['m00']
+    area = moments['m00'] # Note that this computed by Green theroem, so it will probably differ from the result of drawContours
 
     mean_x = moments['m10'] / area
     mean_y = moments['m01'] / area
 
+    # A covariance matrix over all datapoints (contour surrounded regions)
     moments_matrix = np.array([
         [moments['mu20'], moments['mu11']],
         [moments['mu11'], moments['mu02']]
     ]) / area
 
+    # Perform PCA using SVD
     _, svd_u, _ = cv2.SVDecomp(moments_matrix)
 
     center = np.array([mean_x, mean_y])
+    # Use the principle axis as the main direction of this contour object
     tangent = svd_u[:, 0].flatten().copy()
+    # After testing, I found that tangent.x will always be > 0 empirically.
+    # But I think it will be better checking the tangent.x direction to gaurantee point0 is smaller and point1 is bigger in x
+    tangent = (-1 if tangent[0] < 0 else 1) * tangent # normalize the x coordinate
 
     return center, tangent
 
@@ -370,7 +392,7 @@ class ContourInfo(object):
 
         self.contour = contour
         self.rect = rect
-        self.mask = mask
+        self.mask = mask # 1 indicates the contour's inner region
 
         self.center, self.tangent = blob_mean_and_tangent(contour)
 
@@ -381,19 +403,25 @@ class ContourInfo(object):
         lxmin = min(clx)
         lxmax = max(clx)
 
+        # Local expansion range
         self.local_xrng = (lxmin, lxmax)
 
+        # Use the "farest" projection as this contour's expansion interval
         self.point0 = self.center + self.tangent * lxmin
         self.point1 = self.center + self.tangent * lxmax
 
         self.pred = None
         self.succ = None
 
+    # I think the author name it as proj_x is because the text region mainly expand in x axis
     def proj_x(self, point):
+        # Compute |x||tangent|cos theta = |x| cos theta, which is the signed length of x vector projected on self.tangent
         return np.dot(self.tangent, point.flatten()-self.center)
 
+    # Basically, this function will evalutate "parallelism" of two contours,
+    # if two contours is contain too much parallelism, they will have higher score
     def local_overlap(self, other):
-        xmin = self.proj_x(other.point0)
+        xmin = self.proj_x(other.point0) # Other point's projection to the principal axis (length + direction)
         xmax = self.proj_x(other.point1)
         return interval_measure_overlap(self.local_xrng, (xmin, xmax))
 
@@ -403,17 +431,42 @@ def generate_candidate_edge(cinfo_a, cinfo_b):
     # we want a left of b (so a's successor will be b and b's
     # predecessor will be a) make sure right endpoint of b is to the
     # right of left endpoint of a.
-    if cinfo_a.point0[0] > cinfo_b.point1[0]:
+    if cinfo_a.point0[0] > cinfo_b.point1[0]: # contour a's minimum x coordinate must be smaller than contour b's largest
         tmp = cinfo_a
         cinfo_a = cinfo_b
         cinfo_b = tmp
 
+    # Use the mass center of cinfo_a to evaluate the score of cinfo_b's point0 and point1 principal component score
     x_overlap_a = cinfo_a.local_overlap(cinfo_b)
     x_overlap_b = cinfo_b.local_overlap(cinfo_a)
 
+    # The tangent vector between two contour center from left point to right
     overall_tangent = cinfo_b.center - cinfo_a.center
     overall_angle = np.arctan2(overall_tangent[1], overall_tangent[0])
 
+    '''
+        * delta_angle:
+
+        Case 1: b is on the top left of a
+        y
+        ------> x
+        |
+        v
+            -----------
+            |    b    |
+            -----------
+
+                   --------------
+                   |      a     |
+                   --------------
+
+            Then overall_angle (the angle of vector a -> b) will be very large (positive)
+
+        Case 2: a is on the left of b: so the angle of vector a -> b will be very small
+            -----------     --------------
+            |    a    |     |      b     |
+            -----------     --------------
+    '''
     delta_angle = max(angle_dist(cinfo_a.angle, overall_angle),
                       angle_dist(cinfo_b.angle, overall_angle)) * 180/np.pi
 
@@ -422,13 +475,16 @@ def generate_candidate_edge(cinfo_a, cinfo_b):
 
     dist = np.linalg.norm(cinfo_b.point0 - cinfo_a.point1)
 
+    # If either their distance is too far or overlap in x is too large or there angle is too different,
+    # we do not consider the two contours in the same span
     if (dist > EDGE_MAX_LENGTH or
             x_overlap > EDGE_MAX_OVERLAP or
             delta_angle > EDGE_MAX_ANGLE):
         return None
     else:
+        # Give a score of the relationship between two contours
         score = dist + delta_angle*EDGE_ANGLE_COST
-        return (score, cinfo_a, cinfo_b)
+        return (score, cinfo_a, cinfo_b) # cinfo_a: left, cino_b: right
 
 
 def make_tight_mask(contour, xmin, ymin, width, height):
@@ -456,9 +512,10 @@ def get_contours(name, small, pagemask, masktype):
         rect = cv2.boundingRect(contour)
         xmin, ymin, width, height = rect
 
+        # if this region widht or height is too small and its aspect is too small, then we throw away this region
         if (width < TEXT_MIN_WIDTH or
                 height < TEXT_MIN_HEIGHT or
-                width < TEXT_MIN_ASPECT*height):
+                width < TEXT_MIN_ASPECT*height): # equivalent to width / hegith < TEXT_MIN_ASPECT:w
             continue
 
         tight_mask = make_tight_mask(contour, xmin, ymin, width, height)
@@ -476,7 +533,7 @@ def get_contours(name, small, pagemask, masktype):
 
 def assemble_spans(name, small, pagemask, cinfo_list):
 
-    # sort list
+    # sort the contour info list by the value of ymin
     cinfo_list = sorted(cinfo_list, key=lambda cinfo: cinfo.rect[1])
 
     # generate all candidate edges
@@ -492,7 +549,7 @@ def assemble_spans(name, small, pagemask, cinfo_list):
     # sort candidate edges by score (lower is better)
     candidate_edges.sort()
 
-    # for each candidate edge
+    # for each candidate edge, connect two contours
     for _, cinfo_a, cinfo_b in candidate_edges:
         # if left and right are unassigned, join them
         if cinfo_a.succ is None and cinfo_b.pred is None:
@@ -508,6 +565,7 @@ def assemble_spans(name, small, pagemask, cinfo_list):
         # get the first on the list
         cinfo = cinfo_list[0]
 
+        # Get the "first" one
         # keep following predecessors until none exists
         while cinfo.pred:
             cinfo = cinfo.pred
@@ -527,7 +585,7 @@ def assemble_spans(name, small, pagemask, cinfo_list):
             # set successor
             cinfo = cinfo.succ
 
-        # add if long enough
+        # add if long enough, throw away if this span is too short
         if width > SPAN_MIN_WIDTH:
             spans.append(cur_span)
 
@@ -538,6 +596,8 @@ def assemble_spans(name, small, pagemask, cinfo_list):
 
 
 def sample_spans(shape, spans):
+    assert isinstance(shape, tuple)
+    assert isinstance(spans, list)
 
     span_points = []
 
@@ -547,14 +607,29 @@ def sample_spans(shape, spans):
 
         for cinfo in span:
 
+            '''
+                Ex.
+                    totals = 0 0 1 0 1 0 1 0 0      0
+                             1 1 1 1 1 0 1 0 0   x  1
+                             1 1 1 1 1 1 1 1 1      2
+
+                           = 0 0 0 0 0 0 0 0 0
+                             1 1 1 1 1 0 1 0 0
+                             2 2 2 2 2 2 2 2 2
+                        
+                    means  = the mean over rows
+            '''
             yvals = np.arange(cinfo.mask.shape[0]).reshape((-1, 1))
-            totals = (yvals * cinfo.mask).sum(axis=0)
+            totals = (yvals * cinfo.mask).sum(axis=0) # sum over rows
+            # means[i] will be the mean y coordinates of along x axis with value i
             means = totals / cinfo.mask.sum(axis=0)
 
+            # Base coordinates
             xmin, ymin = cinfo.rect[:2]
 
             step = SPAN_PX_PER_STEP
-            start = ((len(means)-1) % step) / 2
+            # Set start from the middle of the first window (step)
+            start = int(((len(means)-1) % step) / 2)
 
             contour_points += [(x+xmin, means[x]+ymin)
                                for x in range(start, len(means), step)]
@@ -571,41 +646,70 @@ def sample_spans(shape, spans):
 
 def keypoints_from_samples(name, small, pagemask, page_outline,
                            span_points):
+    assert isinstance(name, str)
+    assert isinstance(small, np.ndarray)
+    assert isinstance(pagemask, np.ndarray) and small.shape[0:2] == pagemask.shape
+    assert isinstance(page_outline, np.ndarray) and page_outline.shape == (4, 2)
+    assert isinstance(span_points, list)
 
     all_evecs = np.array([[0.0, 0.0]])
     all_weights = 0
 
     for points in span_points:
 
+        # Compute the vector that can maximize the projection variance of the datapoints
         _, evec = cv2.PCACompute(points.reshape((-1, 2)),
                                  None, maxComponents=1)
 
+        # The length of this spans (points[0] --> points[-1])
         weight = np.linalg.norm(points[-1] - points[0])
 
         all_evecs += evec * weight
         all_weights += weight
 
+    # weighted sum of all PCA eigenvectors
     evec = all_evecs / all_weights
 
     x_dir = evec.flatten()
 
+    # Normalize the x coordinate
     if x_dir[0] < 0:
         x_dir = -x_dir
 
+    # The perpendicular vector of x_dir
     y_dir = np.array([-x_dir[1], x_dir[0]])
 
     pagecoords = cv2.convexHull(page_outline)
+    # Normalize pixel coordinate to pagemask centered coordinates
     pagecoords = pix2norm(pagemask.shape, pagecoords.reshape((-1, 1, 2)))
     pagecoords = pagecoords.reshape((-1, 2))
 
     px_coords = np.dot(pagecoords, x_dir)
     py_coords = np.dot(pagecoords, y_dir)
 
-    px0 = px_coords.min()
-    px1 = px_coords.max()
+    px0 = px_coords.min() # the left most in the direction of x_dir
+    px1 = px_coords.max() # the right most in the direction of y_dir
 
     py0 = py_coords.min()
     py1 = py_coords.max()
+
+    '''
+        In the x_dir, y_dir coordinate system (the author defined them as "page" coordinate),
+        corners will look like this
+
+                  |    
+      (px0, py0)  |   (px1, py0)
+        *---------|------*
+        |         |      |
+        ----------|----------> x_dir
+        |         |      |
+        |         |      |
+        |         |      |
+        *---------|------*
+      (px0, py1)  |   (px1, py1)
+                  v
+                 y_dir
+    '''
 
     p00 = px0 * x_dir + py0 * y_dir
     p10 = px1 * x_dir + py0 * y_dir
@@ -621,6 +725,7 @@ def keypoints_from_samples(name, small, pagemask, page_outline,
         pts = points.reshape((-1, 2))
         px_coords = np.dot(pts, x_dir)
         py_coords = np.dot(pts, y_dir)
+        # Set (px0, py0) as the origin (from the perspective of the "page")
         ycoords.append(py_coords.mean() - py0)
         xcoords.append(px_coords - px0)
 
@@ -736,20 +841,20 @@ def optimize_params(name, small, dstpoints, span_counts, params):
         ppts = project_keypoints(pvec, keypoint_index)
         return np.sum((dstpoints - ppts)**2)
 
-    print '  initial objective is', objective(params)
+    print('  initial objective is', objective(params))
 
     if DEBUG_LEVEL >= 1:
         projpts = project_keypoints(params, keypoint_index)
         display = draw_correspondences(small, dstpoints, projpts)
         debug_show(name, 4, 'keypoints before', display)
 
-    print '  optimizing', len(params), 'parameters...'
+    print('  optimizing', len(params), 'parameters...')
     start = datetime.datetime.now()
     res = scipy.optimize.minimize(objective, params,
                                   method='Powell')
     end = datetime.datetime.now()
-    print '  optimization took', round((end-start).total_seconds(), 2), 'sec.'
-    print '  final objective is', res.fun
+    print('  optimization took', round((end-start).total_seconds(), 2), 'sec.')
+    print('  final objective is', res.fun)
     params = res.x
 
     if DEBUG_LEVEL >= 1:
@@ -773,7 +878,7 @@ def get_page_dims(corners, rough_dims, params):
     res = scipy.optimize.minimize(objective, dims, method='Powell')
     dims = res.x
 
-    print '  got page dims', dims[0], 'x', dims[1]
+    print('  got page dims', dims[0], 'x', dims[1])
 
     return dims
 
@@ -786,7 +891,7 @@ def remap_image(name, img, small, page_dims, params):
     width = round_nearest_multiple(height * page_dims[0] / page_dims[1],
                                    REMAP_DECIMATE)
 
-    print '  output will be {}x{}'.format(width, height)
+    print('  output will be {}x{}'.format(width, height))
 
     height_small = height / REMAP_DECIMATE
     width_small = width / REMAP_DECIMATE
@@ -841,7 +946,7 @@ def remap_image(name, img, small, page_dims, params):
 def main():
 
     if len(sys.argv) < 2:
-        print 'usage:', sys.argv[0], 'IMAGE1 [IMAGE2 ...]'
+        print('usage:', sys.argv[0], 'IMAGE1 [IMAGE2 ...]')
         sys.exit(0)
 
     if DEBUG_LEVEL > 0 and DEBUG_OUTPUT != 'file':
@@ -856,8 +961,8 @@ def main():
         basename = os.path.basename(imgfile)
         name, _ = os.path.splitext(basename)
 
-        print 'loaded', basename, 'with size', imgsize(img),
-        print 'and resized to', imgsize(small)
+        print('loaded', basename, 'with size', imgsize(img),)
+        print('and resized to', imgsize(small))
 
         if DEBUG_LEVEL >= 3:
             debug_show(name, 0.0, 'original', small)
@@ -868,20 +973,22 @@ def main():
         spans = assemble_spans(name, small, pagemask, cinfo_list)
 
         if len(spans) < 3:
-            print '  detecting lines because only', len(spans), 'text spans'
+            print('  detecting lines because only', len(spans), 'text spans')
             cinfo_list = get_contours(name, small, pagemask, 'line')
             spans2 = assemble_spans(name, small, pagemask, cinfo_list)
             if len(spans2) > len(spans):
                 spans = spans2
 
         if len(spans) < 1:
-            print 'skipping', name, 'because only', len(spans), 'spans'
+            print('skipping', name, 'because only', len(spans), 'spans')
             continue
 
         span_points = sample_spans(small.shape, spans)
 
-        print '  got', len(spans), 'spans',
-        print 'with', sum([len(pts) for pts in span_points]), 'points.'
+        assert isinstance(span_points, list)
+
+        print('  got', len(spans), 'spans')
+        print('with', sum([len(pts) for pts in span_points]), 'points.')
 
         corners, ycoords, xcoords = keypoints_from_samples(name, small,
                                                            pagemask,
@@ -904,11 +1011,11 @@ def main():
 
         outfiles.append(outfile)
 
-        print '  wrote', outfile
-        print
+        print('  wrote', outfile)
+        print()
 
-    print 'to convert to PDF (requires ImageMagick):'
-    print '  convert -compress Group4 ' + ' '.join(outfiles) + ' output.pdf'
+    print('to convert to PDF (requires ImageMagick):')
+    print('  convert -compress Group4 ' + ' '.join(outfiles) + ' output.pdf')
 
 
 if __name__ == '__main__':
