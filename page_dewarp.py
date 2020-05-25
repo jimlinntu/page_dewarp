@@ -116,10 +116,10 @@ def debug_show(name, step, text, display):
 def round_nearest_multiple(i, factor):
     i = int(i)
     rem = i % factor
-    if not rem:
+    if not rem: # if i is factor * k, then just return i
         return i
     else:
-        return i + factor - rem
+        return i + factor - rem # otherwise, round to the nearest multiple
 
 
 def pix2norm(shape, pts):
@@ -134,6 +134,9 @@ def pix2norm(shape, pts):
 
 
 def norm2pix(shape, pts, as_integer):
+    '''
+        Restore pts to pixel coordinate system
+    '''
     height, width = shape[:2]
     scl = max(height, width)*0.5
     offset = np.array([0.5*width, 0.5*height],
@@ -889,14 +892,14 @@ def get_page_dims(corners, rough_dims, params):
 
     dst_br = corners[2].flatten()
 
-    dims = np.array(rough_dims)
+    dims = np.array(rough_dims) # corners[2] on the world coordinate system should be projected to dst_br
 
     def objective(dims):
         proj_br = project_xy(dims, params)
         return np.sum((dst_br - proj_br.flatten())**2)
 
     res = scipy.optimize.minimize(objective, dims, method='Powell')
-    dims = res.x
+    dims = res.x # find a better page by minimizing the reprojection error dims that can be projected to dst_br
 
     print('  got page dims', dims[0], 'x', dims[1])
 
@@ -905,27 +908,34 @@ def get_page_dims(corners, rough_dims, params):
 
 def remap_image(name, img, small, page_dims, params):
 
-    height = 0.5 * page_dims[1] * OUTPUT_ZOOM * img.shape[0]
+    # page_dims = (width, height) normalized by max(height, width) and scale
+    height = 0.5 * page_dims[1] * OUTPUT_ZOOM * img.shape[0] # rescale page_dims[1] to img's height
     height = round_nearest_multiple(height, REMAP_DECIMATE)
 
+    # height * (original image's width / original image's height)
     width = round_nearest_multiple(height * page_dims[0] / page_dims[1],
                                    REMAP_DECIMATE)
 
     print('  output will be {}x{}'.format(width, height))
 
-    height_small = height / REMAP_DECIMATE
-    width_small = width / REMAP_DECIMATE
+    height_small = int(height / REMAP_DECIMATE)
+    width_small = int(width / REMAP_DECIMATE)
 
     page_x_range = np.linspace(0, page_dims[0], width_small)
     page_y_range = np.linspace(0, page_dims[1], height_small)
+
+    assert len(page_x_range) == width_small
+    assert len(page_y_range) == height_small
 
     page_x_coords, page_y_coords = np.meshgrid(page_x_range, page_y_range)
 
     page_xy_coords = np.hstack((page_x_coords.flatten().reshape((-1, 1)),
                                 page_y_coords.flatten().reshape((-1, 1))))
+    assert page_xy_coords.shape[-1] == 2 # (x, y)
 
     page_xy_coords = page_xy_coords.astype(np.float32)
 
+    # Project world coordinate to image points given parameters
     image_points = project_xy(page_xy_coords, params)
     image_points = norm2pix(img.shape, image_points, False)
 
