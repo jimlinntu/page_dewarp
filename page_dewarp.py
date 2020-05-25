@@ -184,7 +184,7 @@ def get_default_params(corners, ycoords, xcoords):
     # page width and height
     page_width = np.linalg.norm(corners[1] - corners[0])
     page_height = np.linalg.norm(corners[-1] - corners[0])
-    rough_dims = (page_width, page_height)
+    rough_dims = (page_width, page_height) # Rotated page rough dimension
 
     # our initial guess for the cubic has no slope
     cubic_slopes = [0.0, 0.0]
@@ -196,13 +196,20 @@ def get_default_params(corners, ycoords, xcoords):
         [page_width, page_height, 0],
         [0, page_height, 0]])
 
-    # estimate rotation and translation from four 2D-to-3D point
+    # estimate rotation and translation from four 2D-to-3D point (it is an initial guess from only 4 points)
     # correspondences
     _, rvec, tvec = cv2.solvePnP(corners_object3d,
                                  corners, K, np.zeros(5))
 
     span_counts = [len(xc) for xc in xcoords]
 
+    '''
+        params[0:3] == rotation vector
+        params[3:6] == translation vector
+        params[6:8] == cubic_slopes
+        params[8:] == ycoords
+    '''
+    assert len(ycoords) ==  len(xcoords) == len(span_counts)
     params = np.hstack((np.array(rvec).flatten(),
                         np.array(tvec).flatten(),
                         np.array(cubic_slopes).flatten(),
@@ -243,7 +250,7 @@ def project_xy(xy_coords, pvec):
 def project_keypoints(pvec, keypoint_index):
 
     xy_coords = pvec[keypoint_index]
-    xy_coords[0, :] = 0
+    xy_coords[0, :] = 0 # (0,0,0) should be projected to corners[0]
 
     return project_xy(xy_coords, pvec)
 
@@ -817,29 +824,41 @@ def imgsize(img):
 
 
 def make_keypoint_index(span_counts):
+    '''
+        Create indices that can be used to index 
+    '''
 
     nspans = len(span_counts)
     npts = sum(span_counts)
+    # keypoint_index[0]: is a dummy ( I personally think this is for original point fitting?? )
     keypoint_index = np.zeros((npts+1, 2), dtype=int)
     start = 1
 
+    # Setting 8 is because params[0:8] contain rotation, translation and cubic slopes paramters
     for i, count in enumerate(span_counts):
         end = start + count
-        keypoint_index[start:start+end, 1] = 8+i
+        keypoint_index[start:start+end, 1] = 8+i # [start:start+end] span points belong to which i-th span (or which ycoord) (8+i)
         start = end
 
+    # each point's index (8 is for parameters offset, nspans is for ycoords offset)
     keypoint_index[1:, 0] = np.arange(npts) + 8 + nspans
+
+
+    # The author use params[keypoint_index] to retrieve all x and y coordinates
 
     return keypoint_index
 
 
 def optimize_params(name, small, dstpoints, span_counts, params):
+    assert isinstance(small, np.ndarray)
+    assert isinstance(dstpoints, np.ndarray) and dstpoints.shape[-1] == 2 # (x,y)
+    assert isinstance(span_counts, list)
 
     keypoint_index = make_keypoint_index(span_counts)
 
     def objective(pvec):
         ppts = project_keypoints(pvec, keypoint_index)
-        return np.sum((dstpoints - ppts)**2)
+        return np.sum((dstpoints - ppts)**2) # reprojection error
 
     print('  initial objective is', objective(params))
 
@@ -850,6 +869,7 @@ def optimize_params(name, small, dstpoints, span_counts, params):
 
     print('  optimizing', len(params), 'parameters...')
     start = datetime.datetime.now()
+    # Adjust rotation, translation and cubic parameters so that the dstpoints can be fitted
     res = scipy.optimize.minimize(objective, params,
                                   method='Powell')
     end = datetime.datetime.now()
@@ -1001,11 +1021,13 @@ def main():
         dstpoints = np.vstack((corners[0].reshape((1, 1, 2)),) +
                               tuple(span_points))
 
+        ###################### Optimization sections ######################
         params = optimize_params(name, small,
                                  dstpoints,
                                  span_counts, params)
 
         page_dims = get_page_dims(corners, rough_dims, params)
+        ###################################################################
 
         outfile = remap_image(name, img, small, page_dims, params)
 
